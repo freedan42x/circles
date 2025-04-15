@@ -7,11 +7,11 @@
 #include <unistd.h>
 
 #ifndef NO_DEBUG
-#define ASSERT(expr) do {                               \
-    if (!(expr)) {                                      \
-      fprintf(stderr, "assertion %s failed\n", #expr);  \
-      abort();                                          \
-    }                                                   \
+#define ASSERT(expr) do {                                               \
+    if (!(expr)) {                                                      \
+      fprintf(stderr, "%s:%d: assertion %s failed\n", __FILE__, __LINE__, #expr); \
+      abort();                                                          \
+    }                                                                   \
   } while (0)
 #else
 #define ASSERT(...)
@@ -21,15 +21,11 @@ int random_int(int a, int b) {
   return a + rand() % (b - a);
 }
 
-Color random_color(void) {
+Color random_color() {
   return ColorFromHSV(random_int(0, 361), 0.45f, 1.0f);
-  unsigned char r = random_int(0, 256);
-  unsigned char g = random_int(0, 256);
-  unsigned char b = random_int(0, 256);
-  return {r, g, b, 255};
 }
 
-#define vec2s(x) ((Vector2){x, x})
+#define vec2s(x) (Vector2{x, x})
 
 template <class T>
 struct Array {  
@@ -84,15 +80,12 @@ const Vector2 operator-(const Vector2 &a) {
 #define SCREEN_HALF
 
 #ifdef SCREEN_HALF
-#define SCREEN_WIDTH (1920 / 2 + 300)
+#define SCREEN_WIDTH (1920.0f / 2 + 300)
 #define SCREEN_HEIGHT (1080)
 #else
 #define SCREEN_WIDTH 2560
 #define SCREEN_HEIGHT 1440
 #endif
-
-#define MAP_SIZE 20000
-#define ZOOM 1.0f
 
 float exerp(float a, float b, float t) {
   return a * powf(b / a, t);
@@ -112,21 +105,23 @@ struct PositionState {
     return elapsed < total;
   }
 
-  Vector2 update(void) {
+  Vector2 get() {
     float t = elapsed / total;
 
     Vector2 pos;
 
     if (mode == Linear) {
-      pos = Vector2Lerp(start_pos, target_pos, t);
     } else if (mode == Exp) {
-      t = t * t * t;
-      pos.x = exerp(start_pos.x, target_pos.x, t);
-      pos.y = exerp(start_pos.y, target_pos.y, t);
+      float a = 0.15f;
+      t = t * (1.0f - a + a * t);
     }
+    pos = Vector2Lerp(start_pos, target_pos, t);
     
-    elapsed += GetFrameTime();
     return pos;
+  }
+
+  void update() {
+    elapsed += GetFrameTime();
   }
 };
 
@@ -139,22 +134,34 @@ struct MassAnim {
   operator bool() {
     return elapsed < total;
   }
+
+  float get() {
+    float t = elapsed / total;
+    return Lerp(start_mass, target_mass, t);
+  }
+
+  void update() {
+    elapsed += GetFrameTime();
+  }
 };
 
 #define MAX_CELL_COUNT 128
+#define MAP_SIZE 20000
+#define MAX_CELL_COUNT 256
 #define MASS_ANIM_DURATION 0.4f
-#define CELL_MINIMUM_MASS 400
-#define PELLET_MASS 160
+#define CELL_MINIMUM_MASS 1000
+#define PELLET_MASS 400
 
-#define CELL_SPEED_FACTOR 2.5f
-#define SPLIT_TIME_FACTOR 1.0f
+#define CELL_SPEED_FACTOR 2.0f
+#define SPLIT_DURATION_FACTOR 1.1f
+#define CAMERA_DELAY 0.2f
 
 static inline float mass2speed(float mass) {
   return (150.0f - powf(mass, 0.35f)) * CELL_SPEED_FACTOR;
 }
 
 static inline float mass2split_time(float mass) {
-  return (0.1f * logf(mass) - 0.25f) * SPLIT_TIME_FACTOR;
+  return (0.1f * logf(mass) - 0.25f) * SPLIT_DURATION_FACTOR;
 }
 static inline float mass2radius(float mass) {
   return 5.0f * sqrtf(mass / PI);
@@ -180,6 +187,7 @@ struct CellView {
 
 struct Player {
   bool ejecting;
+  Texture2D skin;
   Color color;
   Array<Cell> cells;
   Vector2 hover_pos;
@@ -190,6 +198,8 @@ bool mouse_lock;
 Array<Player> players;
 Vector2 camera_target;
 int frame;
+
+Shader circle_mask;
 
 #define PLAYER players[0]
 #define MULTI players[1]
@@ -202,9 +212,8 @@ struct Pellet {
 
 Array<Pellet> pellets;
 
-void render_pellets(void) {
+void render_pellets() {
   for (auto p : pellets) {
-
     DrawCircleV(p.pos, pellet_radius, p.color);
   }
 }
@@ -217,8 +226,28 @@ void render_cell_view(CellView view) {
     mass = Lerp(m.start_mass, m.target_mass, t);
   }
   float r = mass2radius(mass);
-  DrawCircleSector(view.cell->pos, r, 0, 360, 72, players[view.player_ix].color);
+
+  Texture2D skin = players[view.player_ix].skin;
+  if (IsTextureValid(skin)) {
+    BeginShaderMode(circle_mask);
+    DrawTexturePro(skin, {0, 0, (float) skin.width, (float) skin.height},
+                   {view.cell->pos.x - r, view.cell->pos.y - r, r * 2, r * 2},
+                   {0, 0}, 0, WHITE);
+    EndShaderMode();
+  } else {
+    DrawCircleSector(view.cell->pos, r, 0, 360, 72, players[view.player_ix].color);
+  } 
 }
+
+void mass_anim_make(Cell &cell, float eaten_mass) {
+  cell.mass_anim = {
+    .start_mass = cell.mass_anim ? cell.mass_anim.get() : cell.mass,
+    .target_mass = cell.mass + eaten_mass,
+    .elapsed = 0.0f,
+    .total = MASS_ANIM_DURATION
+  };
+}
+
 
 void handle_border_collision(Vector2 &pos, float r) {
   if (pos.x < r) pos.x = r;
@@ -231,6 +260,7 @@ void handle_pellet_collision(Cell &cell) {
   for (int i = 0; i < pellets.size; i++) {
     handle_border_collision(pellets[i].pos, pellet_radius);
     if (Vector2DistanceSqr(cell.pos, pellets[i].pos) <= cell.radius() * cell.radius()) {
+      mass_anim_make(cell, PELLET_MASS);
       cell.mass += PELLET_MASS;
       pellets.remove_unordered(i);
     }
@@ -245,8 +275,8 @@ void handle_cell_collision(Cell &cell, Player &p) {
       float overlap = c.radius() + cell.radius() - Vector2Distance(c.pos, cell.pos);
       if (overlap > 0) {
         Vector2 push_direction = Vector2Normalize(cell.pos - c.pos);
-        cell.pos += push_direction * overlap / 2 * GetFrameTime() * 5;// * 5;
-        c.pos -= push_direction * overlap / 2 * GetFrameTime() * 5;// * 5;
+        cell.pos += push_direction * (overlap / 2) * GetFrameTime();
+        c.pos -= push_direction * (overlap / 2) * GetFrameTime();
       }
     }
   }
@@ -260,14 +290,9 @@ void handle_enemy_collision(Cell &cell, Player &p) {
     for (int i = 0; i < enemy.cells.size;) {
       Cell c = enemy.cells[i];
       float dst = Vector2DistanceSqr(cell.pos, c.pos);
-      if ((cell.mass > c.mass*1.1f) && (dst <= cell.radius() * cell.radius())) {
+      if ((cell.mass > c.mass*1.2f) && (dst <= cell.radius() * cell.radius())) {
         enemy.cells.remove_ordered(i);
-        cell.mass_anim = {
-          .start_mass = cell.mass,
-          .target_mass = cell.mass + c.mass,
-          .elapsed = 0.0f,
-          .total = MASS_ANIM_DURATION
-        };
+        mass_anim_make(cell, c.mass);
         cell.mass += c.mass;
       } else {
         i++;
@@ -293,9 +318,6 @@ Vector2 get_position_near(Player &neighbor, float spawn_mass) {
   float r = mass2radius(spawn_mass);
   Vector2 sum_pos{};
   float sum_mass = 0.0f;
-  Vector2 p = neighbor.cells[0].pos;
-  float min_x = p.x, max_x = p.x;
-  float min_y = p.y, max_y = p.y;
   for (const auto &cell : neighbor.cells) {
     sum_mass += cell.mass;
     sum_pos += cell.pos;
@@ -343,11 +365,13 @@ void eject_mass(Cell &cell, Player &p) {
   if (cell.mass - PELLET_MASS < CELL_MINIMUM_MASS) return;
 
   Vector2 direction = Vector2Normalize(p.hover_pos - cell.pos);
+  Vector2 pos = cell.pos + direction * (cell.radius() + 10);
   Pellet pellet = {
     .color = random_color(),
+    .pos = pos,
     .eject_state = {
       .mode = PositionState::Linear,
-      .start_pos = cell.pos + direction * (cell.radius() + 10),
+      .start_pos = pos,
       .target_pos = cell.pos + direction * (cell.radius() + 500),
       .elapsed = 0.0f,
       .total = 0.5f
@@ -359,22 +383,21 @@ void eject_mass(Cell &cell, Player &p) {
 
 void update_cell(Cell &cell, Player &p) {
   if (p.ejecting) eject_mass(cell, p);
-  
-  if (cell.mass_anim) {
-    cell.mass_anim.elapsed += GetFrameTime();
-  }
+
+  if (cell.mass_anim) cell.mass_anim.update();
 
   Vector2 speed = vec2s(mass2speed(cell.mass));
-
   Vector2 direction = Vector2Normalize(p.hover_pos - cell.pos);
   Vector2 pos_offset = direction * speed * GetFrameTime();
   PositionState &s = cell.split_state;
   if (s) {
     s.target_pos += pos_offset;
-    cell.pos = s.update();
+    cell.pos = s.get();
+    s.update();
   } else {
     cell.pos += pos_offset;
   }
+  
   handle_cell_collision(cell, p);
   handle_pellet_collision(cell);
   handle_enemy_collision(cell, p);
@@ -390,16 +413,16 @@ void split_cell(Cell &cell, Player &p) {
     .start_mass = cell.mass,
     .target_mass = cell.mass / 2,
     .elapsed = 0.0f,
-    .total = 0.3f
+    .total = MASS_ANIM_DURATION
   };
   cell.mass /= 2;
 
   Cell new_cell{};
   new_cell.pos = cell.pos + direction * cell.radius() / 4;
   new_cell.mass = cell.mass;
-  
+
   new_cell.split_state = {
-    .mode = PositionState::Linear,
+    .mode = PositionState::Exp,
     .start_pos = new_cell.pos,
     .target_pos = cell.pos + direction * cell.radius() * 2,
     .elapsed = 0.0f,
@@ -420,18 +443,26 @@ void reset_map() {
   players = {};
   
   Cell initial_cell{};
-  initial_cell.pos = {MAP_SIZE/2 - 2500, MAP_SIZE/2};
+  initial_cell.pos = {MAP_SIZE/2.0f - 2500, MAP_SIZE/2.0f};
   initial_cell.mass = 400000;
   camera_target = initial_cell.pos;
 
   Player player{};
   player.color = random_color();
+  player.skin = LoadTexture("skins/amr1.png");
+  ASSERT(IsTextureValid(player.skin));
+  GenTextureMipmaps(&player.skin);
+  SetTextureFilter(player.skin, TEXTURE_FILTER_TRILINEAR);
   player.cells.size = 0;
   player.cells.push(initial_cell);
   players.push(player);
-
+  
   Player multi{};
   multi.color = random_color();
+  multi.skin = LoadTexture("skins/dex24.png");
+  ASSERT(IsTextureValid(multi.skin));
+  GenTextureMipmaps(&multi.skin);
+  SetTextureFilter(multi.skin, TEXTURE_FILTER_TRILINEAR);
   multi.cells.size = 0;
   multi.cells.push(initial_cell);
   multi.cells[0].pos.x += 2500;
@@ -440,15 +471,15 @@ void reset_map() {
   pellets.size = 0;
 }
 
-Player &current_tab(void) {
+Player &current_tab() {
   return on_multi ? MULTI : PLAYER;
 }
 
-Player &other_tab(void) {
+Player &other_tab() {
   return on_multi ? PLAYER : MULTI;
 }
 
-int main(void) {
+int main() {
   srand(time(NULL) ^ getpid());
   
   SetConfigFlags(FLAG_MSAA_4X_HINT);
@@ -460,18 +491,21 @@ int main(void) {
   SetWindowPosition(1920/2 + 320, 200);
 #endif
 
+  circle_mask = LoadShader(0, "circle_mask.fs");
+  ASSERT(IsShaderValid(circle_mask));
+
   reset_map();
 
   Camera2D camera{};
   camera.target = PLAYER.cells[0].pos;
-  camera.offset = (Vector2){ SCREEN_WIDTH/2.0f, SCREEN_HEIGHT/2.0f };
+  camera.offset = { SCREEN_WIDTH/2.0f, SCREEN_HEIGHT/2.0f };
   camera.rotation = 0.0f;
   camera.zoom = 0.1f;
 
   camera_target = camera.target;
 
   Array<CellView> sorted_cells{};
-
+  
   while (!WindowShouldClose()) {
     frame++;
 
@@ -517,10 +551,13 @@ int main(void) {
 
     if (camera.zoom > 1.5f) camera.zoom = 1.5f;
     else if (camera.zoom < 0.05f) camera.zoom = 0.05f;
-    
+
     for (auto &p : pellets) {
       PositionState &s = p.eject_state;
-      if (p.eject_state) p.pos = s.update();
+      if (p.eject_state) {
+        p.pos = s.get();
+        s.update();
+      }
     }
 
     for (auto &tab : players) {    
@@ -543,7 +580,7 @@ int main(void) {
     for (int i = 1; i < cells.size; i++) {
       if (cells[i].mass > max_cell.mass) max_cell = cells[i];
     }
-    camera_target += (max_cell.pos - camera_target) * GetFrameTime() * 0.5       ;
+    camera_target += (max_cell.pos - camera_target) * GetFrameTime() * CAMERA_DELAY;
     camera.target = camera_target;
 
     BeginDrawing();        
@@ -554,6 +591,7 @@ int main(void) {
 
     render_pellets();
 
+    // make something smarter instead of sorting each frame.
     sorted_cells.size = 0;
     for (int i = 0; i < players.size; i++) {
       for (auto &cell : players[i].cells) {
