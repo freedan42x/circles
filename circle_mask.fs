@@ -4,14 +4,15 @@ in vec2 fragTexCoord;
 out vec4 finalColor;
 
 uniform sampler2D texture0;
-uniform vec2 resolution;
+
+const float radius = 0.49;
+const float edge = 0.01;
 
 void main() {
   vec2 uv = fragTexCoord;
-  vec2 center = vec2(0.5, 0.5);
-  float dist = distance(uv, center);
+  vec4 tex = texture(texture0, uv);
+  float dist = length(uv - 0.5);
+  float alpha = 1 - smoothstep(radius, radius + edge, dist);
 
-  if (dist > 0.5) discard;
-
-  finalColor = texture(texture0, uv);
+  finalColor = vec4(tex.rgb, tex.a * alpha);
 }

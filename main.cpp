@@ -77,19 +77,15 @@ const Vector2 operator-(const Vector2 &a) {
   return {-a.x, -a.y};
 }
 
-#define SCREEN_HALF
+#define FULLSCREEN
 
-#ifdef SCREEN_HALF
-#define SCREEN_WIDTH (1920.0f / 2 + 300)
-#define SCREEN_HEIGHT (1080)
-#else
+#ifdef FULLSCREEN
 #define SCREEN_WIDTH 2560
 #define SCREEN_HEIGHT 1440
+#else
+#define SCREEN_WIDTH (1920.0f / 2 + 300)
+#define SCREEN_HEIGHT (1080)
 #endif
-
-float exerp(float a, float b, float t) {
-  return a * powf(b / a, t);
-}
 
 struct PositionState {
   enum Mode {
@@ -125,30 +121,40 @@ struct PositionState {
   }
 };
 
-struct MassAnim {
+#define MASS_ANIM_DURATION 0.2f
+struct SmoothMass {
   float start_mass;
   float target_mass;
   float elapsed;
   float total;
-
-  operator bool() {
-    return elapsed < total;
-  }
 
   float get() {
     float t = elapsed / total;
     return Lerp(start_mass, target_mass, t);
   }
 
-  void update() {
-    elapsed += GetFrameTime();
+  void make_instant(float mass) {
+    start_mass = target_mass;
+    target_mass = mass;
+    total = MASS_ANIM_DURATION;
+    elapsed = total;
+  }
+  
+  void update(float mass) {
+    if (!FloatEquals(mass, target_mass)) {
+      start_mass = get();
+      target_mass = mass;
+      elapsed = GetFrameTime();
+      total = MASS_ANIM_DURATION;
+    } else if (elapsed < total) {
+      elapsed += GetFrameTime();
+      if (elapsed > total) elapsed = total;
+    }
   }
 };
 
-#define MAX_CELL_COUNT 128
 #define MAP_SIZE 20000
 #define MAX_CELL_COUNT 256
-#define MASS_ANIM_DURATION 0.4f
 #define CELL_MINIMUM_MASS 1000
 #define PELLET_MASS 400
 
@@ -173,8 +179,8 @@ struct Cell {
   Vector2 pos;
   float mass;
   PositionState split_state;
-  MassAnim mass_anim;
-  
+  SmoothMass smooth_mass;
+
   inline float radius() const {
     return mass2radius(mass);
   }
@@ -185,24 +191,73 @@ struct CellView {
   int player_ix;
 };
 
+struct Assets {
+  Shader circle_mask;
+  Shader circle_mask_outline;
+
+  void load_shader(Shader &sh, const char *fs) {
+    ASSERT(FileExists(fs));
+    sh = LoadShader(0, fs);
+    ASSERT(IsShaderValid(sh));
+  }
+};
+
+Assets assets;
+
+#define SKIN_SIZE 512
+struct Skin {
+  Texture2D texture;
+
+  void load(const char *filepath, Shader sh=assets.circle_mask) {
+    Texture2D skin_texture = LoadTexture(filepath);
+    ASSERT(IsTextureValid(skin_texture));
+    ASSERT(skin_texture.width == SKIN_SIZE && skin_texture.height == SKIN_SIZE);
+
+    RenderTexture2D render_texture = LoadRenderTexture(SKIN_SIZE, SKIN_SIZE);
+
+    BeginTextureMode(render_texture);
+    BeginShaderMode(sh);
+    DrawTexture(skin_texture, 0, 0, WHITE);
+    EndShaderMode();
+    EndTextureMode();
+
+    UnloadTexture(skin_texture);
+
+    Image img = LoadImageFromTexture(render_texture.texture);
+    UnloadRenderTexture(render_texture);
+    texture = LoadTextureFromImage(img);
+    UnloadImage(img);
+    GenTextureMipmaps(&texture);
+    SetTextureFilter(texture, TEXTURE_FILTER_TRILINEAR);
+  }
+
+  void render(Vector2 pos, float r) {
+    DrawTexturePro(texture,
+                   {0, 0, (float)texture.width, (float)-texture.height},
+                   {pos.x - r, pos.y - r, r * 2, r * 2},
+                   {0, 0}, 0, WHITE);
+  }
+};
+
 struct Player {
   bool ejecting;
-  Texture2D skin;
+  bool mouse_freeze;
+  Skin skin;
   Color color;
   Array<Cell> cells;
   Vector2 hover_pos;
 };
 
 bool on_multi;
-bool mouse_lock;
 Array<Player> players;
+Skin skin_outlines[2];
 Vector2 camera_target;
 int frame;
 
-Shader circle_mask;
-
-#define PLAYER players[0]
-#define MULTI players[1]
+#define PLAYER_IX 0
+#define MULTI_IX 1
+#define PLAYER players[PLAYER_IX]
+#define MULTI players[MULTI_IX]
 
 struct Pellet {
   Color color;
@@ -219,35 +274,20 @@ void render_pellets() {
 }
 
 void render_cell_view(CellView view) {
-  float mass = view.cell->mass;
-  MassAnim &m = view.cell->mass_anim;
-  if (m) {
-    float t = m.elapsed / m.total;
-    mass = Lerp(m.start_mass, m.target_mass, t);
-  }
-  float r = mass2radius(mass);
+  float r = mass2radius(view.cell->smooth_mass.get());
 
-  Texture2D skin = players[view.player_ix].skin;
-  if (IsTextureValid(skin)) {
-    BeginShaderMode(circle_mask);
-    DrawTexturePro(skin, {0, 0, (float) skin.width, (float) skin.height},
-                   {view.cell->pos.x - r, view.cell->pos.y - r, r * 2, r * 2},
-                   {0, 0}, 0, WHITE);
-    EndShaderMode();
+  Skin skin = players[view.player_ix].skin;
+  if (IsTextureValid(skin.texture)) {
+    int ix = on_multi ? MULTI_IX : PLAYER_IX;
+    if (view.player_ix == ix) {
+      skin_outlines[ix].render(view.cell->pos, r);
+    } else {
+      players[view.player_ix].skin.render(view.cell->pos, r);
+    }
   } else {
     DrawCircleSector(view.cell->pos, r, 0, 360, 72, players[view.player_ix].color);
-  } 
+  }
 }
-
-void mass_anim_make(Cell &cell, float eaten_mass) {
-  cell.mass_anim = {
-    .start_mass = cell.mass_anim ? cell.mass_anim.get() : cell.mass,
-    .target_mass = cell.mass + eaten_mass,
-    .elapsed = 0.0f,
-    .total = MASS_ANIM_DURATION
-  };
-}
-
 
 void handle_border_collision(Vector2 &pos, float r) {
   if (pos.x < r) pos.x = r;
@@ -260,7 +300,6 @@ void handle_pellet_collision(Cell &cell) {
   for (int i = 0; i < pellets.size; i++) {
     handle_border_collision(pellets[i].pos, pellet_radius);
     if (Vector2DistanceSqr(cell.pos, pellets[i].pos) <= cell.radius() * cell.radius()) {
-      mass_anim_make(cell, PELLET_MASS);
       cell.mass += PELLET_MASS;
       pellets.remove_unordered(i);
     }
@@ -292,7 +331,6 @@ void handle_enemy_collision(Cell &cell, Player &p) {
       float dst = Vector2DistanceSqr(cell.pos, c.pos);
       if ((cell.mass > c.mass*1.2f) && (dst <= cell.radius() * cell.radius())) {
         enemy.cells.remove_ordered(i);
-        mass_anim_make(cell, c.mass);
         cell.mass += c.mass;
       } else {
         i++;
@@ -384,7 +422,7 @@ void eject_mass(Cell &cell, Player &p) {
 void update_cell(Cell &cell, Player &p) {
   if (p.ejecting) eject_mass(cell, p);
 
-  if (cell.mass_anim) cell.mass_anim.update();
+  cell.smooth_mass.update(cell.mass);
 
   Vector2 speed = vec2s(mass2speed(cell.mass));
   Vector2 direction = Vector2Normalize(p.hover_pos - cell.pos);
@@ -409,17 +447,12 @@ void split_cell(Cell &cell, Player &p) {
   if (cell.split_state) cell.split_state = {};
         
   Vector2 direction = Vector2Normalize(p.hover_pos - cell.pos);
-  cell.mass_anim = {
-    .start_mass = cell.mass,
-    .target_mass = cell.mass / 2,
-    .elapsed = 0.0f,
-    .total = MASS_ANIM_DURATION
-  };
   cell.mass /= 2;
 
   Cell new_cell{};
   new_cell.pos = cell.pos + direction * cell.radius() / 4;
   new_cell.mass = cell.mass;
+  new_cell.smooth_mass.make_instant(cell.mass);
 
   new_cell.split_state = {
     .mode = PositionState::Exp,
@@ -437,32 +470,30 @@ void split(Player &p) {
   for (int i = 0; i < size; i++) split_cell(p.cells[i], p);
 }
 
+#define PLAYER_SKIN "skins/amr1.png"
+#define MULTI_SKIN "skins/dex24.png"
+
 void reset_map() {
-  mouse_lock = false;
   on_multi = false;
   players = {};
   
   Cell initial_cell{};
-  initial_cell.pos = {MAP_SIZE/2.0f - 2500, MAP_SIZE/2.0f};
+  initial_cell.pos = {MAP_SIZE / 2.0f - 2500, MAP_SIZE / 2.0f};
   initial_cell.mass = 400000;
+  initial_cell.smooth_mass.make_instant(initial_cell.mass);
   camera_target = initial_cell.pos;
 
   Player player{};
   player.color = random_color();
-  player.skin = LoadTexture("skins/amr1.png");
-  ASSERT(IsTextureValid(player.skin));
-  GenTextureMipmaps(&player.skin);
-  SetTextureFilter(player.skin, TEXTURE_FILTER_TRILINEAR);
+  player.skin.load(PLAYER_SKIN);
   player.cells.size = 0;
   player.cells.push(initial_cell);
   players.push(player);
   
   Player multi{};
   multi.color = random_color();
-  multi.skin = LoadTexture("skins/dex24.png");
-  ASSERT(IsTextureValid(multi.skin));
-  GenTextureMipmaps(&multi.skin);
-  SetTextureFilter(multi.skin, TEXTURE_FILTER_TRILINEAR);
+  multi.skin.load(MULTI_SKIN);
+
   multi.cells.size = 0;
   multi.cells.push(initial_cell);
   multi.cells[0].pos.x += 2500;
@@ -481,21 +512,25 @@ Player &other_tab() {
 
 int main() {
   srand(time(NULL) ^ getpid());
-  
+
   SetConfigFlags(FLAG_MSAA_4X_HINT);
+
   InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, " circles ");
-#ifndef SCREEN_HALF
-  ToggleFullscreen();
-#endif
-#ifdef SCREEN_HALF
+#ifndef FULLSCREEN
   SetWindowPosition(1920/2 + 320, 200);
 #endif
+  #ifdef FULLSCREEN
+  SetWindowState(FLAG_BORDERLESS_WINDOWED_MODE);
+#endif
 
-  circle_mask = LoadShader(0, "circle_mask.fs");
-  ASSERT(IsShaderValid(circle_mask));
+  assets.load_shader(assets.circle_mask, "circle_mask.fs");
+  assets.load_shader(assets.circle_mask_outline, "circle_mask_outline.fs");
+
+  skin_outlines[PLAYER_IX].load(PLAYER_SKIN, assets.circle_mask_outline);
+  skin_outlines[MULTI_IX].load(MULTI_SKIN, assets.circle_mask_outline);
 
   reset_map();
-
+  
   Camera2D camera{};
   camera.target = PLAYER.cells[0].pos;
   camera.offset = { SCREEN_WIDTH/2.0f, SCREEN_HEIGHT/2.0f };
@@ -511,9 +546,9 @@ int main() {
 
     DrawFPS(0, 0);
     DrawText(TextFormat("%d", current_tab().cells.size), 10, 10, 40, BLUE);
-    if (mouse_lock) DrawText("Freeze", 80, 10, 40, RED);
+    if (current_tab().mouse_freeze) DrawText("Freeze", 80, 10, 40, RED);
     
-    if (!mouse_lock) {
+    if (!current_tab().mouse_freeze) {
       current_tab().hover_pos = GetScreenToWorld2D(GetMousePosition(), camera);
     }
     
@@ -540,7 +575,7 @@ int main() {
     }
 
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-      mouse_lock = !mouse_lock;
+      current_tab().mouse_freeze = !current_tab().mouse_freeze;
     }
 
     if (IsKeyPressed(KEY_R)) {
@@ -570,7 +605,8 @@ int main() {
       current_tab().cells.size = 0;
       current_tab().color = random_color();
       Cell cell{};
-      cell.mass = 200000;
+      cell.mass = 400000;
+      cell.smooth_mass.make_instant(cell.mass);
       cell.pos = get_position_near(other_tab(), cell.mass);
       current_tab().cells.push(cell);
     }
@@ -591,7 +627,8 @@ int main() {
 
     render_pellets();
 
-    // make something smarter instead of sorting each frame.
+    // TODO: make something smarter instead of sorting each frame.
+    // TODO: if mass is changing a little (like feeding each other), it jitters if overlapping
     sorted_cells.size = 0;
     for (int i = 0; i < players.size; i++) {
       for (auto &cell : players[i].cells) {
@@ -606,7 +643,9 @@ int main() {
       return ((CellView *) b)->cell->mass < ((CellView *) a)->cell->mass ? 1 : -1;
     });
 
-    for (auto &view : sorted_cells) render_cell_view(view);
+    for (auto &view : sorted_cells) {
+      render_cell_view(view);
+    }
 
     EndMode2D();
     EndDrawing();
